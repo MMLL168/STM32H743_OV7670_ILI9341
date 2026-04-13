@@ -1,0 +1,9 @@
+build/
+mx.scratch/
+auto_sweeps/
+frame_*.png
+__pycache__/
+tools/__pycache__/
+OV7670app.pdf
+um2407-stm32h7-nucleo144-boards-mb1364-stmicroelectronics.pdf
+!.settings/

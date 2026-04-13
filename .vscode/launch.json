@@ -1,0 +1,47 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Cortex Debug (OpenOCD)",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/NUCLEO-H743ZI2_OV7670_ILI9341_template.elf",
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "servertype": "openocd",
+            "openOCDPath": "C:/ST/STM32CubeIDE_1.18.1/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.openocd.win32_2.4.400.202601091506/tools/bin/openocd.exe",
+            "searchDir": [
+                "C:/ST/STM32CubeIDE_1.18.1/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.debug.openocd_2.3.300.202602021527/resources/openocd/st_scripts"
+            ],
+            "configFiles": [
+                "${workspaceFolder}/openocd.cfg"
+            ],
+            "device": "STM32H743ZI",
+            "armToolchainPath": "${userHome}/.vscode/extensions/chipcode-nl.gcc-arm-windows-1.0.1/bin",
+            "preLaunchTask": "CMake Build",
+            "overrideAttachCommands": [
+                "monitor reset init"
+            ],
+            "overrideRestartCommands": [
+                "monitor reset halt"
+            ],
+            "swoConfig": {
+                "enabled": true,
+                "cpuFrequency": 480000000,
+                "swoFrequency": 2000000,
+                "source": "probe",
+                "decoders": [
+                    {
+                        "type": "console",
+                        "label": "SWO ITM",
+                        "port": 0
+                    }
+                ]
+            },
+            "liveWatch": {
+                "enabled": true,
+                "samplesPerSecond": 4
+            }
+        }
+    ]
+}

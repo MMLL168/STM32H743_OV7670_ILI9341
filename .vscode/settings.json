@@ -1,0 +1,26 @@
+{
+    "cortex-debug.liveWatchExpressions": [
+        "lcd_dbg",
+        "cam_dbg",
+        "hspi1.State",
+        "hspi1.ErrorCode",
+        "hdcmi.State",
+        "hdcmi.ErrorCode",
+        "info.state",
+        "info.fps",
+        "info.frame_count"
+    ],
+    "cmake.cmakePath": "cube-cmake",
+    "cmake.configureArgs": [
+        "-DCMAKE_COMMAND=cube-cmake"
+    ],
+    "cmake.preferredGenerators": [
+        "Ninja"
+    ],
+    "stm32cube-ide-clangd.path": "cube",
+    "stm32cube-ide-clangd.arguments": [
+        "starm-clangd",
+        "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-gcc*",
+        "--query-driver=${env:CUBE_BUNDLE_PATH}/gnu-tools-for-stm32/14.3.1+st.2/bin/arm-none-eabi-g++*"
+    ]
+}

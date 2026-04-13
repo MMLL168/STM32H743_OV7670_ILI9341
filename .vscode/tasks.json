@@ -1,0 +1,15 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake Build",
+            "type": "cmake",
+            "command": "build",
+            "group": "build",
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "detail": "CMake GUI or CMake Tools Extension build"
+        }
+    ]
+}
