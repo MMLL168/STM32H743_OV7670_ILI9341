@@ -222,6 +222,7 @@ class DebugGui:
         self.worker: SerialWorker | None = None
         self.image_refs = {}
         self.latest_variant_images: dict[str, Image.Image] = {}
+        self.latest_window_lines: list[str] = []
         self.auto_active = False
         self.auto_pending_shift: int | None = None
         self.auto_max_shift = 0
@@ -251,8 +252,9 @@ class DebugGui:
         self.latest_raw_frame: tuple[int, int, bytes] | None = None  # (w, h, pixel_data)
 
         # OV7670 camera tuning sliders (register, default)
-        self.cam_r_gain = tk.IntVar(value=0x02)      # RED  (reg 0x02)
-        self.cam_b_gain = tk.IntVar(value=0x02)      # BLUE (reg 0x01)
+        self.cam_r_gain = tk.IntVar(value=0x40)      # RED  (reg 0x02)
+        self.cam_b_gain = tk.IntVar(value=0x60)      # BLUE (reg 0x01)
+        self.cam_g_gain = tk.IntVar(value=0x40)      # GREEN (reg 0x6A)
         self.cam_saturation = tk.IntVar(value=0x80)   # Sat  (reg 0xC9)
         self.cam_brightness = tk.IntVar(value=0x00)   # Bright (reg 0x55)
         self.cam_contrast = tk.IntVar(value=0x40)     # Contrast (reg 0x56)
@@ -334,6 +336,8 @@ class DebugGui:
             ("Reset Baseline (x)", "x"),
             ("PCLK Rise (r)", "r"),
             ("PCLK Fall (f)", "f"),
+            ("LCD SPI /8", "8"),
+            ("LCD SPI /4", "4"),
             ("Byte Swap (b)", "b"),
             ("H- (j)", "j"),
             ("H+ (l)", "l"),
@@ -501,11 +505,12 @@ class DebugGui:
         cam_sliders = [
             ("R Gain",     self.cam_r_gain,     0, 255, 0x02),
             ("B Gain",     self.cam_b_gain,     0, 255, 0x01),
+            ("G Gain",     self.cam_g_gain,     0, 255, 0x6A),
             ("Saturation", self.cam_saturation, 0, 255, 0xC9),
             ("Brightness", self.cam_brightness, 0, 255, 0x55),
             ("Contrast",   self.cam_contrast,   0, 255, 0x56),
             ("MTX1 (R)",   self.cam_mtx1,       0, 255, 0x4F),
-            ("MTX2 (G→R)", self.cam_mtx2,       0, 255, 0x50),
+            ("MTX2 (G->R)",self.cam_mtx2,       0, 255, 0x50),
             ("MTX5 (G)",   self.cam_mtx5,       0, 255, 0x53),
             ("MTX6 (B)",   self.cam_mtx6,       0, 255, 0x54),
         ]
@@ -534,19 +539,36 @@ class DebugGui:
         for ci in range(cols_per_row):
             cam_frame.columnconfigure(ci * 3 + 1, weight=1)
 
-        # --- Bottom: status + log ---
+        # --- Bottom: status + window snapshot + log ---
         status_bar = ttk.Frame(container, padding=(8, 0, 8, 8))
         status_bar.grid(row=5, column=0, sticky="nsew")
         status_bar.columnconfigure(0, weight=1)
-        status_bar.rowconfigure(1, weight=1)
 
         ttk.Label(status_bar, textvariable=self.frame_var).grid(row=0, column=0, sticky="w", pady=(0, 2))
 
+        snapshot_frame = ttk.LabelFrame(status_bar, text="Latest Window / Freeze Snapshot", padding=4)
+        snapshot_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        snapshot_frame.columnconfigure(0, weight=1)
+        self.snapshot_text = tk.Text(snapshot_frame, wrap="word", height=6)
+        self.snapshot_text.grid(row=0, column=0, sticky="nsew")
+        snap_scroll = ttk.Scrollbar(snapshot_frame, orient="vertical", command=self.snapshot_text.yview)
+        snap_scroll.grid(row=0, column=1, sticky="ns")
+        self.snapshot_text.configure(yscrollcommand=snap_scroll.set)
+        self.snapshot_text.insert("end", "No window snapshot yet.\n")
+        self.snapshot_text.configure(state="disabled")
+
+        # Log header with clear button
+        log_header = ttk.Frame(status_bar)
+        log_header.grid(row=2, column=0, columnspan=2, sticky="ew")
+        ttk.Label(log_header, text="UART Log").pack(side="left")
+        ttk.Button(log_header, text="Clear", width=6, command=self._clear_log).pack(side="right")
+
         self.log_text = tk.Text(status_bar, wrap="word", height=6)
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.log_text.grid(row=3, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(status_bar, orient="vertical", command=self.log_text.yview)
-        scroll.grid(row=1, column=1, sticky="ns")
+        scroll.grid(row=3, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
+        status_bar.rowconfigure(3, weight=1)
 
     def _reflow_buttons(self, event=None):
         """Re-layout command buttons into rows that fit the available width."""
@@ -787,7 +809,11 @@ class DebugGui:
 
     _TRACK_RE = re.compile(
         r"\[TRACK\]\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"
+        r"(?:\s+ang=(\d+))?(?:\s+pwm=(\d+))?"
     )
+
+    def _clear_log(self):
+        self.log_text.delete("1.0", "end")
 
     def append_log(self, text: str):
         self.log_text.insert("end", text)
@@ -796,8 +822,23 @@ class DebugGui:
 
     def _consume_log_tags(self, text: str):
         for line in text.splitlines():
+            if line.startswith("[WIN]"):
+                self._parse_window_snapshot(line)
             if line.startswith("[TRACK]"):
                 self._parse_track(line)
+
+    def _parse_window_snapshot(self, line: str):
+        if line.startswith("[WIN] state="):
+            self.latest_window_lines = [line]
+        elif self.latest_window_lines:
+            self.latest_window_lines.append(line)
+        else:
+            self.latest_window_lines = [line]
+
+        self.snapshot_text.configure(state="normal")
+        self.snapshot_text.delete("1.0", "end")
+        self.snapshot_text.insert("end", "\n".join(self.latest_window_lines) + "\n")
+        self.snapshot_text.configure(state="disabled")
 
     def _parse_track(self, line: str):
         if "none" in line:
@@ -808,6 +849,8 @@ class DebugGui:
         m = self._TRACK_RE.search(line)
         if not m:
             return
+        ang = int(m.group(8)) if m.group(8) else None
+        pwm = int(m.group(9)) if m.group(9) else None
         self.track_info = {
             "cx": int(m.group(1)),
             "cy": int(m.group(2)),
@@ -816,10 +859,17 @@ class DebugGui:
             "min_y": int(m.group(5)),
             "max_x": int(m.group(6)),
             "max_y": int(m.group(7)),
+            "angle": ang,
+            "pwm": pwm,
         }
         t = self.track_info
+        extra = ""
+        if ang is not None:
+            extra += f" {ang}deg"
+        if pwm is not None:
+            extra += f" {pwm}us"
         if not self.track_local.get():
-            self.track_var.set(f"FW: ({t['cx']},{t['cy']}) n={t['count']}")
+            self.track_var.set(f"FW: ({t['cx']},{t['cy']}) n={t['count']}{extra}")
         self.refresh_preview_images()
 
     @staticmethod
@@ -986,10 +1036,23 @@ class DebugGui:
         self.append_log(f"[HOST] Sent HSV thresholds: H=[{h_lo}..{h_hi}] S>={s_min} V>={v_min} min_px={n}\n")
 
     def _on_cam_slider(self, var: tk.IntVar, reg: int):
-        """Send OV7670 register write when a camera tuning slider changes."""
+        """Send OV7670 register write when a camera tuning slider changes (throttled)."""
+        # Cancel any pending send for the same register
+        pending_id = getattr(self, '_cam_slider_pending', {}).get(reg)
+        if pending_id is not None:
+            self.root.after_cancel(pending_id)
+        if not hasattr(self, '_cam_slider_pending'):
+            self._cam_slider_pending = {}
+        # Delay 500ms so rapid dragging doesn't flood UART
+        self._cam_slider_pending[reg] = self.root.after(
+            500, lambda: self._cam_slider_send(var, reg)
+        )
+
+    def _cam_slider_send(self, var: tk.IntVar, reg: int):
         val = int(var.get())
         cmd = f"W{reg:02X},{val:02X}\n"
         self._send_command(cmd, echo=False)
+        self._cam_slider_pending.pop(reg, None)
 
     def _draw_tracking_overlay(self, img: Image.Image, src_w: int, src_h: int) -> Image.Image:
         """Draw tracking bounding box + crosshair on a display-sized image."""
@@ -1016,8 +1079,12 @@ class DebugGui:
         draw.line([(cx, cy - arm), (cx, cy + arm)], fill="cyan", width=2)
 
         # Label
-        draw.text((x0, max(0, y0 - 14)), f"({t['cx']},{t['cy']}) n={t['count']}",
-                  fill="yellow")
+        label = f"({t['cx']},{t['cy']}) n={t['count']}"
+        if t.get("angle") is not None:
+            label += f" {t['angle']}deg"
+        if t.get("pwm") is not None:
+            label += f" {t['pwm']}us"
+        draw.text((x0, max(0, y0 - 14)), label, fill="yellow")
         return img
 
     def _apply_red_mask(self, img: Image.Image, src_w: int, src_h: int) -> Image.Image:

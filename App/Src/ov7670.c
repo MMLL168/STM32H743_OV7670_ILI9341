@@ -129,7 +129,12 @@ static const RegVal_t ov7670_qvga_rgb565[] = {
     {0xA8, 0xF0},   /* HAECC5 */
     {0xA9, 0x90},   /* HAECC6 */
     {0xAA, 0x94},   /* HAECC7 */
-    {0x13, 0xE5},   /* COM8: enable AWB + AEC + AGC */
+    {0x13, 0xE3},   /* COM8: enable AEC + AGC, disable AWB */
+
+    /* ---- Manual white balance (AWB off) ---- */
+    {0x01, 0x60},   /* BLUE: B channel gain (raise to fix yellow tint) */
+    {0x02, 0x40},   /* RED:  R channel gain */
+    {0x6A, 0x40},   /* GGAIN: G channel gain */
 
     /* ---- Colour matrix (high saturation, reduce G cross-talk) ---- */
     {0x4F, 0xC0}, {0x50, 0x90}, {0x51, 0x00},   /* MTX1-3: boost R, cut G-to-R */

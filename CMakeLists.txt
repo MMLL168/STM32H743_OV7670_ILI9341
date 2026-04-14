@@ -48,6 +48,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/Src/ili9341.c
     App/Src/ov7670.c
     App/Src/gui.c
+    App/Src/servo_pwm.c
     App/Src/app.c
 )
 

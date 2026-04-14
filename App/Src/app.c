@@ -12,6 +12,7 @@
 #include "ili9341.h"
 #include "ov7670.h"
 #include "gui.h"
+#include "servo_pwm.h"
 #include "dcmi.h"
 #include "i2c.h"
 #include "spi.h"
@@ -28,10 +29,11 @@
 #define APP_DEBUG_BOOT          1
 #define DEBUG_SYNC_TIMEOUT_MS   5000U
 #define DEBUG_SYNC_MIN_FRAMES   3U
+#define PREVIEW_OVERLAY_PERIOD_MS 1000U
 #define RED_TRACK_MIN_PIXELS_DEFAULT  60U
 #define RED_TRACK_BOX_COLOR   COLOR_YELLOW
 #define RED_TRACK_CROSS_COLOR COLOR_CYAN
-#define PREVIEW_HSHIFT_DEFAULT 4
+#define PREVIEW_HSHIFT_DEFAULT 0
 #define PREVIEW_HSHIFT_MAX     4
 
 __attribute__((section(".axi_sram"), aligned(32)))
@@ -58,6 +60,7 @@ static bool              display_byte_swap;
 static bool              sensor_byte_swap;
 static uint8_t           sensor_pixel_shift;
 static int8_t            sensor_hshift_steps;
+static uint32_t          lcd_spi_prescaler;
 static bool              sensor_manual_sharpness;
 static uint8_t           sensor_sharpness;
 static bool              sensor_manual_denoise;
@@ -69,9 +72,24 @@ static uint8_t           red_g_max   = 12U;
 static uint8_t           red_b_max   = 12U;
 static uint16_t          red_min_px  = RED_TRACK_MIN_PIXELS_DEFAULT;
 
+/* Deferred OV7670 register write (avoid SPI/I2C conflict) */
+static volatile bool     ov_write_pending;
+static uint8_t           ov_write_reg;
+static uint8_t           ov_write_val;
+
 /* FPS calculation */
 static uint32_t fps_tick_start;
 static uint32_t fps_frame_count;
+static uint32_t perf_tick_start;
+static uint32_t perf_transfer_accum_ms;
+static uint32_t perf_overlay_accum_ms;
+static uint32_t perf_frames_accum;
+static uint32_t perf_transfer_avg_ms;
+static uint32_t perf_overlay_avg_ms;
+static uint32_t perf_capture_last_tick;
+static uint32_t perf_capture_accum_ms;
+static uint32_t perf_capture_samples;
+static uint32_t perf_capture_avg_ms;
 
 /* State machine timing */
 static uint32_t state_entry_tick;
@@ -139,8 +157,12 @@ static void State_M6_RedTracking(void);
 static void TransferFrameToLCD(const uint8_t *fb);
 static void TransferFrameToLCD_Grayscale(const uint8_t *fb);
 static void TransferFrameToLCD_Edge(const uint8_t *fb);
+static void LCD_SendFrameChunkedDMA(const uint8_t *data, uint32_t len);
 static void ChangeState(AppState_t new_state);
 static void UpdateFPS(void);
+static void PerfReset(void);
+static void PerfRecordFrame(uint32_t transfer_ms, uint32_t overlay_ms);
+static bool ApplyLcdSpiPrescaler(uint32_t prescaler);
 static void DumpFrameToUART(const uint8_t *fb);
 static void ApplyOv7670SyncDefaults(void);
 static void ApplyDcmiSync(uint32_t pck_polarity, uint32_t vs_polarity, uint32_t hs_polarity);
@@ -149,6 +171,7 @@ static void ApplyCameraTuning(void);
 static void UART_Log(const char *fmt, ...);
 static void PrintFieldControlHelp(void);
 static void PollFieldControlCommand(void);
+static void ProcessDeferredOvWrite(void);
 static void LogWindowAndFreezeDiag(void);
 static const char *AppStateName(AppState_t state);
 static void StartUart3RxIT(void);
@@ -187,6 +210,7 @@ void App_Init(void)
     sensor_byte_swap = false;
     sensor_pixel_shift = 0;
     sensor_hshift_steps = PREVIEW_HSHIFT_DEFAULT;
+    lcd_spi_prescaler = hspi1.Init.BaudRatePrescaler;
     sensor_manual_sharpness = false;
     sensor_sharpness = 8U;
     sensor_manual_denoise = false;
@@ -218,6 +242,9 @@ void App_Init(void)
 
     /* ---- LCD ---- */
     LCD_Init(&hspi1);
+
+    /* ---- Servo PWM on PB15 (TIM12 CH2, 400 Hz) ---- */
+    Servo_Init();
 
     /* Start from field-debug flow or normal milestone demo */
 #if APP_DEBUG_BOOT
@@ -260,6 +287,8 @@ static void State_F0_LivePreview(void)
 {
     static uint32_t entry_stamp = 0;
     static bool freeze_warned = false;
+    static uint32_t overlay_last_draw_tick = 0;
+    static bool overlay_dirty = false;
 
     if (StateEntered(&entry_stamp)) {
         LCD_FillColor(COLOR_BLACK);
@@ -283,27 +312,52 @@ static void State_F0_LivePreview(void)
         info.track_y = 0;
         info.track_pixels = 0;
         freeze_warned = false;
+        overlay_last_draw_tick = HAL_GetTick();
+        overlay_dirty = false;
+        PerfReset();
         OV7670_StartCapture((uint32_t *)frame_buf[write_buf_idx]);
         UART_Log("\r\n[F0] Live preview mode\r\n");
     }
 
     if (frame_ready) {
         frame_ready = false;
+        bool had_freeze_warning = freeze_warned;
+        uint32_t transfer_ms = 0U;
+        uint32_t overlay_ms = 0U;
+        uint32_t now;
 
         {
             uint8_t disp_idx = write_buf_idx ^ 1U;
+            uint32_t t0 = HAL_GetTick();
             TransferFrameToLCD(frame_buf[disp_idx]);
+            transfer_ms = HAL_GetTick() - t0;
         }
 
         fps_frame_count++;
         UpdateFPS();
-
-        GUI_DrawStatusBar("F0: Live Preview", info.fps);
-        GUI_DrawInfoBox(200,
-                        "UART: p/c/t/d w/x",
-                        "r/f b j/l q/e a/s");
-
         freeze_warned = false;
+        now = HAL_GetTick();
+        if (had_freeze_warning) {
+            overlay_dirty = true;
+        }
+        if (now - overlay_last_draw_tick >= PREVIEW_OVERLAY_PERIOD_MS) {
+            uint32_t t1 = HAL_GetTick();
+            GUI_DrawStatusBar("F0: Live Preview", info.fps);
+            overlay_ms = HAL_GetTick() - t1;
+            overlay_last_draw_tick = HAL_GetTick();
+        }
+        if (overlay_dirty) {
+            uint32_t t2 = HAL_GetTick();
+            GUI_DrawInfoBox(200,
+                            "UART: p/c/t/d w/x",
+                            "r/f b j/l q/e a/s");
+            overlay_ms += HAL_GetTick() - t2;
+            overlay_dirty = false;
+        }
+        PerfRecordFrame(transfer_ms, overlay_ms);
+
+        /* Process deferred OV7670 register write after all LCD SPI is done */
+        ProcessDeferredOvWrite();
         info.frame_count++;
     }
 
@@ -321,6 +375,7 @@ static void State_F0_LivePreview(void)
         UART_Log("[F0] WARN: no DCMI frame callback for %lu ms; preview may be frozen\r\n",
                  (unsigned long)(HAL_GetTick() - last_frame_callback_tick));
         freeze_warned = true;
+        overlay_dirty = true;
     }
 }
 
@@ -922,6 +977,8 @@ static void State_M5_Grayscale(void)
         fps_frame_count++;
         UpdateFPS();
         info.frame_count++;
+
+        ProcessDeferredOvWrite();
     }
 
     if (HAL_GetTick() - state_entry_tick > 24000) {
@@ -971,11 +1028,17 @@ static void State_M6_RedTracking(void)
         info.track_pixels = track.count;
 
         if (track.found) {
-            snprintf(status, sizeof(status), "M6: (%u,%u)",
-                     track.cx, track.cy);
-            UART_Log("[TRACK] %u %u %lu %u %u %u %u\r\n",
+            /* Map X (0..CAM_WIDTH-1) to angle (0..359) for servo */
+            uint16_t angle = (uint16_t)((uint32_t)track.cx * 359U / (CAM_WIDTH - 1U));
+            uint16_t pulse = (uint16_t)(1000U + (uint32_t)angle * 1000U / 359U);
+            Servo_SetAngle(angle);
+
+            snprintf(status, sizeof(status), "M6: (%u,%u) %udeg",
+                     track.cx, track.cy, angle);
+            UART_Log("[TRACK] %u %u %lu %u %u %u %u ang=%u pwm=%u\r\n",
                      track.cx, track.cy, (unsigned long)track.count,
-                     track.min_x, track.min_y, track.max_x, track.max_y);
+                     track.min_x, track.min_y, track.max_x, track.max_y,
+                     angle, pulse);
         } else {
             snprintf(status, sizeof(status), "M6: Red not found");
             UART_Log("[TRACK] none\r\n");
@@ -988,6 +1051,8 @@ static void State_M6_RedTracking(void)
         fps_frame_count++;
         UpdateFPS();
         info.frame_count++;
+
+        ProcessDeferredOvWrite();
     }
 }
 
@@ -999,10 +1064,13 @@ static void TransferFrameToLCD(const uint8_t *fb)
     const uint32_t x_scale = LCD_WIDTH / CAM_WIDTH;
     const uint32_t y_scale = LCD_HEIGHT / CAM_HEIGHT;
 
-    LCD_SetWindow(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+    if (x_scale == 1U && y_scale == 1U && !display_byte_swap) {
+        LCD_SetWindow(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+        LCD_SendFrameChunkedDMA(fb, CAM_FRAME_SIZE);
+        return;
+    }
 
-    LCD_DC_DATA();
-    LCD_CS_LOW();
+    LCD_SetWindow(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
 
     for (uint32_t y = 0; y < CAM_HEIGHT; y++) {
         const uint16_t *src = (const uint16_t *)(fb + y * CAM_WIDTH * 2U);
@@ -1019,11 +1087,10 @@ static void TransferFrameToLCD(const uint8_t *fb)
             }
         }
         for (uint32_t i = 0; i < y_scale; i++) {
-            HAL_SPI_Transmit(&hspi1, line_buf[0], LINE_BUF_SIZE, 100);
+            LCD_SendData_DMA(line_buf[0], LINE_BUF_SIZE);
+            LCD_WaitDMA();
         }
     }
-
-    LCD_CS_HIGH();
 }
 
 /* ---- Grayscale conversion ---- */
@@ -1033,9 +1100,6 @@ static void TransferFrameToLCD_Grayscale(const uint8_t *fb)
     const uint32_t y_scale = LCD_HEIGHT / CAM_HEIGHT;
 
     LCD_SetWindow(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
-
-    LCD_DC_DATA();
-    LCD_CS_LOW();
 
     for (uint32_t y = 0; y < CAM_HEIGHT; y++) {
         const uint16_t *src = (const uint16_t *)(fb + y * CAM_WIDTH * 2U);
@@ -1055,11 +1119,10 @@ static void TransferFrameToLCD_Grayscale(const uint8_t *fb)
             }
         }
         for (uint32_t i = 0; i < y_scale; i++) {
-            HAL_SPI_Transmit(&hspi1, line_buf[0], LINE_BUF_SIZE, 100);
+            LCD_SendData_DMA(line_buf[0], LINE_BUF_SIZE);
+            LCD_WaitDMA();
         }
     }
-
-    LCD_CS_HIGH();
 }
 
 /* ---- Simple Sobel edge detection ---- */
@@ -1069,9 +1132,6 @@ static void TransferFrameToLCD_Edge(const uint8_t *fb)
     const uint32_t y_scale = LCD_HEIGHT / CAM_HEIGHT;
 
     LCD_SetWindow(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
-
-    LCD_DC_DATA();
-    LCD_CS_LOW();
 
     for (uint32_t y = 0; y < CAM_HEIGHT; y++) {
         uint16_t *dst = (uint16_t *)line_buf[0];
@@ -1120,11 +1180,25 @@ static void TransferFrameToLCD_Edge(const uint8_t *fb)
             }
         }
         for (uint32_t i = 0; i < y_scale; i++) {
-            HAL_SPI_Transmit(&hspi1, line_buf[0], LINE_BUF_SIZE, 100);
+            LCD_SendData_DMA(line_buf[0], LINE_BUF_SIZE);
+            LCD_WaitDMA();
         }
     }
+}
 
-    LCD_CS_HIGH();
+static void LCD_SendFrameChunkedDMA(const uint8_t *data, uint32_t len)
+{
+    const uint32_t max_chunk = 60000U;
+    uint32_t remaining = len;
+    const uint8_t *ptr = data;
+
+    while (remaining > 0U) {
+        uint32_t chunk = (remaining > max_chunk) ? max_chunk : remaining;
+        LCD_SendData_DMA(ptr, chunk);
+        LCD_WaitDMA();
+        ptr += chunk;
+        remaining -= chunk;
+    }
 }
 
 static uint32_t CountNonZeroBytes(const uint8_t *fb)
@@ -1196,6 +1270,18 @@ static void ApplyCameraTuning(void)
     }
 }
 
+static bool ApplyLcdSpiPrescaler(uint32_t prescaler)
+{
+    LCD_WaitDMA();
+    HAL_SPI_DeInit(&hspi1);
+    hspi1.Init.BaudRatePrescaler = prescaler;
+    if (HAL_SPI_Init(&hspi1) != HAL_OK) {
+        return false;
+    }
+    lcd_spi_prescaler = prescaler;
+    return true;
+}
+
 static void UART_Log(const char *fmt, ...)
 {
     char buf[192];
@@ -1233,6 +1319,8 @@ static void PrintFieldControlHelp(void)
     UART_Log("[CTRL]   l = horizontal window right +8 px\r\n");
     UART_Log("[CTRL]   q/e = sharpness -/+ (manual)\r\n");
     UART_Log("[CTRL]   a/s = denoise -/+ (manual)\r\n");
+    UART_Log("[CTRL]   8 = LCD SPI prescaler /8\r\n");
+    UART_Log("[CTRL]   4 = LCD SPI prescaler /4\r\n");
     UART_Log("[CTRL]   m = toggle OV7670 COM3[6] byte swap\r\n");
     UART_Log("[CTRL]   z = sweep baseline (COM3[6]=ON, PSHFT=0)\r\n");
     UART_Log("[CTRL]   [ = PSHFT -1\r\n");
@@ -1390,6 +1478,26 @@ static void PollFieldControlCommand(void)
                 ChangeState(info.state);
                 break;
 
+            case '8':
+                OV7670_StopCapture();
+                if (ApplyLcdSpiPrescaler(SPI_BAUDRATEPRESCALER_8)) {
+                    UART_Log("[CTRL] -> LCD SPI /8\r\n");
+                    ChangeState(info.state);
+                } else {
+                    UART_Log("[CTRL] WARN: failed to set LCD SPI /8\r\n");
+                }
+                break;
+
+            case '4':
+                OV7670_StopCapture();
+                if (ApplyLcdSpiPrescaler(SPI_BAUDRATEPRESCALER_4)) {
+                    UART_Log("[CTRL] -> LCD SPI /4\r\n");
+                    ChangeState(info.state);
+                } else {
+                    UART_Log("[CTRL] WARN: failed to set LCD SPI /4\r\n");
+                }
+                break;
+
             case 'm':
                 sensor_byte_swap = !sensor_byte_swap;
                 OV7670_StopCapture();
@@ -1469,7 +1577,8 @@ static void PollFieldControlCommand(void)
             }
 
             case 'W': {
-                /* Generic OV7670 register write: "W<reg_hex>,<val_hex>\n" */
+                /* Generic OV7670 register write: "W<reg_hex>,<val_hex>\n"
+                 * Deferred to frame gap to avoid SPI/I2C bus conflict. */
                 char wbuf[32];
                 uint8_t wi = 0;
                 while (uart_rx_tail != uart_rx_head && wi < sizeof(wbuf) - 1U) {
@@ -1481,14 +1590,9 @@ static void PollFieldControlCommand(void)
                 wbuf[wi] = '\0';
                 unsigned reg_v, val_v;
                 if (sscanf(wbuf, "%x,%x", &reg_v, &val_v) == 2 && reg_v <= 0xFF && val_v <= 0xFF) {
-                    if (OV7670_WriteReg((uint8_t)reg_v, (uint8_t)val_v) == HAL_OK) {
-                        uint8_t rb = 0;
-                        OV7670_ReadReg((uint8_t)reg_v, &rb);
-                        UART_Log("[CTRL] OV7670 reg 0x%02X = 0x%02X (rb=0x%02X)\r\n",
-                                 reg_v, val_v, rb);
-                    } else {
-                        UART_Log("[CTRL] OV7670 write reg 0x%02X failed\r\n", reg_v);
-                    }
+                    ov_write_reg = (uint8_t)reg_v;
+                    ov_write_val = (uint8_t)val_v;
+                    ov_write_pending = true;
                 } else {
                     UART_Log("[CTRL] Bad format (expect W<reg_hex>,<val_hex>)\r\n");
                 }
@@ -1582,6 +1686,34 @@ static void StartUart3RxIT(void)
     (void)HAL_UART_Receive_IT(&huart3, &uart3_rx_byte, 1);
 }
 
+static void ProcessDeferredOvWrite(void)
+{
+    static uint32_t last_write_tick = 0;
+
+    if (!ov_write_pending) return;
+
+    /* Rate-limit: at least 200ms between writes */
+    if (HAL_GetTick() - last_write_tick < 200U) return;
+
+    /* Don't write if SPI is busy (LCD DMA in progress) */
+    if (hspi1.State != HAL_SPI_STATE_READY) return;
+
+    /* Also check I2C is ready */
+    if (hi2c2.State != HAL_I2C_STATE_READY) return;
+
+    ov_write_pending = false;
+    last_write_tick = HAL_GetTick();
+
+    if (OV7670_WriteReg(ov_write_reg, ov_write_val) == HAL_OK) {
+        uint8_t rb = 0;
+        OV7670_ReadReg(ov_write_reg, &rb);
+        UART_Log("[CTRL] OV7670 reg 0x%02X = 0x%02X (rb=0x%02X)\r\n",
+                 ov_write_reg, ov_write_val, rb);
+    } else {
+        UART_Log("[CTRL] OV7670 write reg 0x%02X failed\r\n", ov_write_reg);
+    }
+}
+
 static void LogWindowAndFreezeDiag(void)
 {
     uint8_t com10 = 0;
@@ -1668,6 +1800,9 @@ static void LogWindowAndFreezeDiag(void)
              (unsigned long)DCMI->CR,
              (unsigned long)GetDcmiNdtr(),
              (unsigned long)hdcmi.ErrorCode);
+    UART_Log("[WIN] lcd spi=%s\r\n",
+             (lcd_spi_prescaler == SPI_BAUDRATEPRESCALER_4) ? "/4" :
+             (lcd_spi_prescaler == SPI_BAUDRATEPRESCALER_8) ? "/8" : "?");
     UART_Log("[WIN] reg COM10=%02X TSLB=%02X COM3=%02X COM14=%02X MVFP=%02X PSHFT=%02X\r\n",
              com10, tslb, com3, com14, mvfp, pshift);
     UART_Log("[WIN] hwin HSTART=%02X HSTOP=%02X HREF=%02X -> start=%u stop=%u edge=%u\r\n",
@@ -1686,6 +1821,15 @@ static void LogWindowAndFreezeDiag(void)
     if (last_frame_callback_tick != 0U &&
         (HAL_GetTick() - last_frame_callback_tick > 1500U)) {
         UART_Log("[WIN] warn no recent DCMI frame callback; preview can freeze on last frame\r\n");
+    }
+    {
+        uint32_t fps10 = (info.fps <= 0.0f) ? 0U : (uint32_t)(info.fps * 10.0f + 0.5f);
+        UART_Log("[WIN] perf fps=%lu.%lu xfer_avg_ms=%lu overlay_avg_ms=%lu capture_avg_ms=%lu\r\n",
+                 (unsigned long)(fps10 / 10U),
+                 (unsigned long)(fps10 % 10U),
+                 (unsigned long)perf_transfer_avg_ms,
+                 (unsigned long)perf_overlay_avg_ms,
+                 (unsigned long)perf_capture_avg_ms);
     }
 }
 
@@ -2066,6 +2210,44 @@ static void UpdateFPS(void)
     }
 }
 
+static void PerfReset(void)
+{
+    perf_tick_start = HAL_GetTick();
+    perf_transfer_accum_ms = 0U;
+    perf_overlay_accum_ms = 0U;
+    perf_frames_accum = 0U;
+    perf_transfer_avg_ms = 0U;
+    perf_overlay_avg_ms = 0U;
+    perf_capture_last_tick = 0U;
+    perf_capture_accum_ms = 0U;
+    perf_capture_samples = 0U;
+    perf_capture_avg_ms = 0U;
+}
+
+static void PerfRecordFrame(uint32_t transfer_ms, uint32_t overlay_ms)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t dt = now - perf_tick_start;
+
+    perf_transfer_accum_ms += transfer_ms;
+    perf_overlay_accum_ms += overlay_ms;
+    perf_frames_accum++;
+
+    if (dt >= 1000U && perf_frames_accum != 0U) {
+        perf_transfer_avg_ms = perf_transfer_accum_ms / perf_frames_accum;
+        perf_overlay_avg_ms = perf_overlay_accum_ms / perf_frames_accum;
+        if (perf_capture_samples != 0U) {
+            perf_capture_avg_ms = perf_capture_accum_ms / perf_capture_samples;
+        }
+        perf_transfer_accum_ms = 0U;
+        perf_overlay_accum_ms = 0U;
+        perf_frames_accum = 0U;
+        perf_capture_accum_ms = 0U;
+        perf_capture_samples = 0U;
+        perf_tick_start = now;
+    }
+}
+
 const AppInfo_t *App_GetInfo(void)
 {
     return &info;
@@ -2105,9 +2287,16 @@ static void DumpFrameToUART(const uint8_t *fb)
 /* ================================================================== */
 void App_DCMI_FrameCallback(void)
 {
+    uint32_t now = HAL_GetTick();
+
+    if (perf_capture_last_tick != 0U) {
+        perf_capture_accum_ms += (now - perf_capture_last_tick);
+        perf_capture_samples++;
+    }
+    perf_capture_last_tick = now;
     frame_counter++;
     frame_ready = true;
-    last_frame_callback_tick = HAL_GetTick();
+    last_frame_callback_tick = now;
 
     /* Swap ping-pong buffer for next capture */
     write_buf_idx ^= 1;
