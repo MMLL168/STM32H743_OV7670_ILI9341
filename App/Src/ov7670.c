@@ -159,7 +159,7 @@ static const RegVal_t ov7670_qvga_rgb565[] = {
     {0x0E, 0x61},   /* COM5 */
     {0x0F, 0x4B},   /* COM6 */
     {0x16, 0x02},   /* Reserved */
-    {0x1E, 0x37},   /* MVFP: mirror (bit5) + vertical flip (bit4) */
+    {0x1E, 0x27},   /* MVFP: mirror ON, vflip OFF → adds 180° + H-mirror vs. original 0x37 */
     {0x21, 0x02},   /* ADCCTR1 */
     {0x22, 0x91},   /* ADCCTR2 */
     {0x29, 0x07},   /* RSVD */
